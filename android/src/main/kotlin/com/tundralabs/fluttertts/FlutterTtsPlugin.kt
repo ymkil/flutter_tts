@@ -358,7 +358,14 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                 }
                 val fileName: String? = call.argument("fileName")
                 val isFullPath: Boolean? = call.argument("isFullPath")
-                synthesizeToFile(text!!, fileName!!, isFullPath!!)
+                val b = synthesizeToFile(text!!, fileName!!, isFullPath!!)
+                if (!b) {
+                    synchronized(this@FlutterTtsPlugin) {
+                        val suspendedCall = Runnable { onMethodCall(call, result) }
+                        pendingMethodCalls.add(suspendedCall)
+                    }
+                    return
+                }
                 if (awaitSynthCompletion) {
                     synth = true
                     synthResult = result
@@ -715,7 +722,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         }
     }
 
-    private fun synthesizeToFile(text: String, fileName: String, isFullPath: Boolean) {
+    private fun synthesizeToFile(text: String, fileName: String, isFullPath: Boolean): Boolean {
         val fullPath: String
         val uuid: String = UUID.randomUUID().toString()
         bundle!!.putString(
@@ -723,36 +730,44 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             SYNTHESIZE_TO_FILE_PREFIX + uuid
         )
 
-        val result: Int =
-            if(isFullPath){
-                val file = File(fileName)
-                fullPath = file.path
+        return if (ismServiceConnectionUsable(tts)) {
+            val result: Int =
+                if(isFullPath){
+                    val file = File(fileName)
+                    fullPath = file.path
 
-                tts!!.synthesizeToFile(text, bundle!!, file!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                val resolver = this.context?.contentResolver
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, "audio/wav")
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_MUSIC)
+                    tts!!.synthesizeToFile(text, bundle!!, file!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    val resolver = this.context?.contentResolver
+                    val contentValues = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                        put(MediaStore.MediaColumns.MIME_TYPE, "audio/wav")
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_MUSIC)
+                    }
+                    val uri = resolver?.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, contentValues)
+                    this.parcelFileDescriptor = resolver?.openFileDescriptor(uri!!, "rw")
+                    fullPath = uri?.path + File.separatorChar + fileName
+
+                    tts!!.synthesizeToFile(text, bundle!!, parcelFileDescriptor!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
+                } else {
+                    val musicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+                    val file = File(musicDir, fileName)
+                    fullPath = file.path
+
+                    tts!!.synthesizeToFile(text, bundle!!, file!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
                 }
-                val uri = resolver?.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, contentValues)
-                this.parcelFileDescriptor = resolver?.openFileDescriptor(uri!!, "rw")
-                fullPath = uri?.path + File.separatorChar + fileName
 
-                tts!!.synthesizeToFile(text, bundle!!, parcelFileDescriptor!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
+            if (result == TextToSpeech.SUCCESS) {
+                Log.d(tag, "Successfully created file : $fullPath")
+                true
             } else {
-                val musicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
-                val file = File(musicDir, fileName)
-                fullPath = file.path
-
-                tts!!.synthesizeToFile(text, bundle!!, file!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
+                Log.d(tag, "Failed creating file : $fullPath")
+                false
             }
-
-        if (result == TextToSpeech.SUCCESS) {
-            Log.d(tag, "Successfully created file : $fullPath")
         } else {
-            Log.d(tag, "Failed creating file : $fullPath")
+            ttsStatus = null
+            tts = TextToSpeech(context, onInitListenerWithoutCallback, selectedEngine)
+            false
         }
     }
 
