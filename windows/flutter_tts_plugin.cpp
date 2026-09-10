@@ -9,21 +9,72 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <stdexcept>
+#include <algorithm>
+#include <vector>
+#include <winrt/Windows.Foundation.h>
 
 typedef std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> FlutterResult;
 //typedef flutter::MethodResult<flutter::EncodableValue>* PFlutterResult;
 
 std::unique_ptr<flutter::MethodChannel<>> methodChannel;
 
+namespace {
+	struct SynthesisState {
+		bool active = false;
+		bool alive = true;
+	};
+
+	// 任务仅持有独立状态，插件销毁后不再访问实例或发送回调。
+	winrt::Windows::Foundation::IAsyncAction writeSynthesis(
+		std::function<void()> writeFile, std::shared_ptr<SynthesisState> state,
+		FlutterResult result, winrt::apartment_context caller) {
+		std::string error;
+		co_await winrt::resume_background();
+		try {
+			winrt::init_apartment(winrt::apartment_type::multi_threaded);
+			struct ApartmentGuard { ~ApartmentGuard() { winrt::uninit_apartment(); } } apartment;
+			writeFile();
+		}
+		catch (const winrt::hresult_error& e) {
+			error = winrt::to_string(e.message());
+			if (error.empty()) error = "Speech synthesis failed";
+		}
+		catch (const std::exception& e) {
+			error = e.what();
+		}
+		catch (...) {
+			error = "Speech synthesis failed";
+		}
+		// MethodChannel 和 MethodResult 必须在调用线程上使用。
+		try { co_await caller; }
+		catch (...) { co_return; }
+		state->active = false;
+		if (!state->alive) co_return;
+		if (error.empty()) {
+			methodChannel->InvokeMethod("synth.onComplete", nullptr);
+			if (result) result->Success(1);
+		}
+		else {
+			methodChannel->InvokeMethod("synth.onError",
+				std::make_unique<flutter::EncodableValue>(error));
+			if (result) result->Success(0);
+		}
+	}
+}
+
 #if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_DESKTOP_APP)
 #include <winrt/Windows.Media.SpeechSynthesis.h>
 #include <winrt/Windows.Media.Playback.h>
 #include <winrt/Windows.Media.Core.h>
+#include <winrt/Windows.Storage.Streams.h>
 using namespace winrt;
 using namespace Windows::Media::SpeechSynthesis;
 using namespace Concurrency;
 using namespace std::chrono_literals;
-#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 namespace {
 	class FlutterTtsPlugin : public flutter::Plugin {
@@ -37,6 +88,9 @@ namespace {
 			const flutter::MethodCall<flutter::EncodableValue>& method_call,
 			std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 		void speak(const std::string, FlutterResult);
+		std::function<void()> synthesisWriter(const std::string&, const std::filesystem::path&);
+		bool awaitSynthCompletion = false;
+		std::shared_ptr<SynthesisState> synthesisState = std::make_shared<SynthesisState>();
 		void pause();
 		void continuePlay();
 		void stop();
@@ -114,6 +168,45 @@ namespace {
         if (awaitSpeakCompletion) speakResult = std::move(result);
         else result->Success(1);
 	};
+
+	std::function<void()> FlutterTtsPlugin::synthesisWriter(
+		const std::string& text, const std::filesystem::path& path) {
+		const auto voiceId = synth.Voice().Id();
+		const auto volume = synth.Options().AudioVolume();
+		const auto pitchValue = synth.Options().AudioPitch();
+		const auto rate = synth.Options().SpeakingRate();
+		return [text, path, voiceId, volume, pitchValue, rate]() {
+			// 独立合成器保留调用时的设置，不改变正在播放的语音。
+			SpeechSynthesizer fileSynth;
+			for (const auto& voice : SpeechSynthesizer::AllVoices()) {
+				if (voice.Id() == voiceId) { fileSynth.Voice(voice); break; }
+			}
+			fileSynth.Options().AudioVolume(volume);
+			fileSynth.Options().AudioPitch(pitchValue);
+			fileSynth.Options().SpeakingRate(rate);
+			auto stream = fileSynth.SynthesizeTextToStreamAsync(to_hstring(text)).get();
+			Windows::Storage::Streams::DataReader reader(stream);
+			std::ofstream output;
+			output.exceptions(std::ios::failbit | std::ios::badbit);
+			output.open(path, std::ios::binary | std::ios::trunc);
+			// 分块写入，避免长文本对应的音频一次性占用大量内存。
+			std::vector<uint8_t> buffer(65536);
+			uint64_t remaining = stream.Size();
+			while (remaining > 0) {
+				const auto count = static_cast<uint32_t>((std::min)(remaining, uint64_t(buffer.size())));
+				if (reader.LoadAsync(count).get() != count) {
+					throw std::runtime_error("Incomplete speech synthesis stream");
+				}
+				reader.ReadBytes(winrt::array_view<uint8_t>(buffer.data(), buffer.data() + count));
+				output.write(reinterpret_cast<const char*>(buffer.data()), count);
+				remaining -= count;
+			}
+			output.close();
+			reader.Close();
+			stream.Close();
+			fileSynth.Close();
+		};
+	}
 
 	void FlutterTtsPlugin::pause() {
 		mPlayer.Pause();
@@ -224,7 +317,7 @@ namespace {
 		speakResult = FlutterResult();
 	}
 
-	FlutterTtsPlugin::~FlutterTtsPlugin() { mPlayer.Close(); }
+	FlutterTtsPlugin::~FlutterTtsPlugin() { synthesisState->alive = false; mPlayer.Close(); }
 
 	void FlutterTtsPlugin::HandleMethodCall(
 		const flutter::MethodCall<flutter::EncodableValue>& method_call,
@@ -257,6 +350,9 @@ namespace {
 			std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
 		void speak(const std::string, FlutterResult);
+		std::function<void()> synthesisWriter(const std::string&, const std::filesystem::path&);
+		bool awaitSynthCompletion = false;
+		std::shared_ptr<SynthesisState> synthesisState = std::make_shared<SynthesisState>();
 		void pause();
 		void continuePlay();
 		void stop();
@@ -314,6 +410,7 @@ namespace {
 	}
 
 	FlutterTtsPlugin::~FlutterTtsPlugin() {
+		synthesisState->alive = false;
 		::CoUninitialize();
 	}
 
@@ -356,6 +453,49 @@ namespace {
 		}
 		else result->Success(1);
 	}
+	std::function<void()> FlutterTtsPlugin::synthesisWriter(
+		const std::string& text, const std::filesystem::path& path) {
+		CComPtr<ISpObjectToken> token;
+		winrt::check_hresult(pVoice->GetVoice(&token));
+		CComHeapPtr<wchar_t> tokenId;
+		winrt::check_hresult(token->GetId(&tokenId));
+		const std::wstring voiceId(tokenId.m_pData);
+		USHORT volume;
+		long rate;
+		winrt::check_hresult(pVoice->GetVolume(&volume));
+		winrt::check_hresult(pVoice->GetRate(&rate));
+		// SAPI 使用 XML 设置音调，正文必须转义以保留 &、< 等字符。
+		std::string escaped;
+		for (const char ch : text) {
+			if (ch == '&') escaped += "&amp;";
+			else if (ch == '<') escaped += "&lt;";
+			else if (ch == '>') escaped += "&gt;";
+			else escaped += ch;
+		}
+		const auto xml = winrt::to_hstring("<pitch middle='" +
+			std::to_string(int((pitch - 1) * 10 * (1 + (pitch < 1)))) + "'>" + escaped + "</pitch>");
+		return [path, voiceId, volume, rate, xml]() {
+			// COM 对象在工作线程创建和释放，避免跨 apartment 使用 pVoice。
+			CComPtr<ISpVoice> voice;
+			CComPtr<ISpObjectToken> voiceToken;
+			CComPtr<ISpStream> stream;
+			winrt::check_hresult(voice.CoCreateInstance(CLSID_SpVoice));
+			winrt::check_hresult(SpGetTokenFromId(voiceId.c_str(), &voiceToken));
+			winrt::check_hresult(voice->SetVoice(voiceToken));
+			winrt::check_hresult(voice->SetVolume(volume));
+			winrt::check_hresult(voice->SetRate(rate));
+			CSpStreamFormat format;
+			winrt::check_hresult(format.AssignFormat(SPSF_22kHz16BitMono));
+			winrt::check_hresult(SPBindToFile(path.c_str(), SPFM_CREATE_ALWAYS,
+				&stream, &format.FormatId(), format.WaveFormatExPtr()));
+			winrt::check_hresult(voice->SetOutput(stream, TRUE));
+			winrt::check_hresult(voice->Speak(xml.c_str(), SPF_IS_XML, nullptr));
+			winrt::check_hresult(voice->SetOutput(nullptr, FALSE));
+			// Close 完成 WAV 头部写入后，才能报告合成成功。
+			winrt::check_hresult(stream->Close());
+		};
+	}
+
 	void FlutterTtsPlugin::pause()
 	{
 		if (isPaused == false)
@@ -556,6 +696,58 @@ namespace {
 			result->Success(flutter::EncodableValue(version_stream.str()));
 		}
 #endif
+		else if (method_call.method_name() == "awaitSynthCompletion") {
+			const auto* args = method_call.arguments();
+			if (args && std::holds_alternative<bool>(*args)) {
+				awaitSynthCompletion = std::get<bool>(*args);
+				result->Success(1);
+			}
+			else result->Success(0);
+		}
+		else if (method_call.method_name() == "synthesizeToFile") {
+			const auto* args = method_call.arguments();
+			const auto* map = args ? std::get_if<flutter::EncodableMap>(args) : nullptr;
+			if (!map || synthesisState->active) { result->Success(0); return; }
+			const auto textIt = map->find(flutter::EncodableValue("text"));
+			const auto fileIt = map->find(flutter::EncodableValue("fileName"));
+			const auto fullIt = map->find(flutter::EncodableValue("isFullPath"));
+			if (textIt == map->end() || fileIt == map->end() ||
+				!std::holds_alternative<std::string>(textIt->second) ||
+				!std::holds_alternative<std::string>(fileIt->second) ||
+				(fullIt != map->end() && !std::holds_alternative<bool>(fullIt->second))) {
+				result->Success(0); return;
+			}
+			const auto& text = std::get<std::string>(textIt->second);
+			const auto& fileName = std::get<std::string>(fileIt->second);
+			if (text.empty() || fileName.empty() || text.find('\0') != std::string::npos ||
+				fileName.find('\0') != std::string::npos) { result->Success(0); return; }
+			try {
+				auto path = std::filesystem::u8path(fileName);
+				const bool fullPath = fullIt != map->end() && std::get<bool>(fullIt->second);
+				if (fullPath != path.is_absolute() || !path.has_filename()) {
+					result->Success(0); return;
+				}
+				path = std::filesystem::absolute(path);
+				auto writer = synthesisWriter(text, path);
+				winrt::apartment_context caller;
+				synthesisState->active = true;
+				methodChannel->InvokeMethod("synth.onStart", nullptr);
+				if (!awaitSynthCompletion) { result->Success(1); result.reset(); }
+				writeSynthesis(std::move(writer), synthesisState, std::move(result), caller);
+			}
+			catch (const winrt::hresult_error& e) {
+				synthesisState->active = false;
+				methodChannel->InvokeMethod("synth.onError",
+					std::make_unique<flutter::EncodableValue>(winrt::to_string(e.message())));
+				if (result) result->Success(0);
+			}
+			catch (const std::exception& e) {
+				synthesisState->active = false;
+				methodChannel->InvokeMethod("synth.onError",
+					std::make_unique<flutter::EncodableValue>(e.what()));
+				if (result) result->Success(0);
+			}
+		}
 		else if (method_call.method_name().compare("awaitSpeakCompletion") == 0) {
             const flutter::EncodableValue arg = method_call.arguments()[0];
             if (std::holds_alternative<bool>(arg)) {

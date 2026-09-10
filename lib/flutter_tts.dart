@@ -346,7 +346,7 @@ class FlutterTts {
       await _channel.invokeMethod('awaitSpeakCompletion', awaitCompletion);
 
   /// [Future] which sets synthesize to file's future to return on completion of the synthesize
-  /// ***Android, iOS, and macOS supported only***
+  /// ***Android、iOS、macOS 和 Windows 支持***
   Future<dynamic> awaitSynthCompletion(bool awaitCompletion) async =>
       await _channel.invokeMethod('awaitSynthCompletion', awaitCompletion);
 
@@ -372,7 +372,11 @@ class FlutterTts {
   }
 
   /// [Future] which invokes the platform specific method for synthesizeToFile
-  /// ***Android and iOS supported only***
+  /// ***Android、iOS、macOS 和 Windows 支持***
+  /// Windows 输出 WAV 文件；[isFullPath] 为 false 时，[fileName] 相对于进程当前工作目录，
+  /// 为 true 时必须为绝对路径。父目录必须存在，同名文件会被覆盖。
+  /// Windows 默认返回 1 表示任务已接受；启用 [awaitSynthCompletion] 后，写入完成才返回 1，
+  /// 失败返回 0。合成期间的新文件合成请求返回 0，播放不受影响。
   Future<dynamic> synthesizeToFile(String text, String fileName,
           [bool isFullPath = false]) async =>
       _channel.invokeMethod('synthesizeToFile', <String, dynamic>{

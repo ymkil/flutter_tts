@@ -182,9 +182,10 @@ await flutterTts.isLanguageAvailable("en-US");
 //see the "Pausing on Android" section for more info
 await flutterTts.pause();
 
-// iOS, macOS, and Android only
+// iOS、macOS、Android 和 Windows 支持
+// Windows 输出 WAV；相对路径以进程当前工作目录为基准，父目录需已存在。
 // The last parameter is an optional boolean value for isFullPath (defaults to false)
-await flutterTts.synthesizeToFile("Hello World", Platform.isAndroid ? "tts.wav" : "tts.caf", false);
+await flutterTts.synthesizeToFile("Hello World", (Platform.isAndroid || Platform.isWindows) ? "tts.wav" : "tts.caf", false);
 
 // Each voice is a Map containing at least these keys: name, locale
 // - Windows (UWP voices) only: gender, identifier

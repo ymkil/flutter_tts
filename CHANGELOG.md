@@ -1,5 +1,9 @@
 # ChangeLog
 
+## Unreleased
+
+- **Windows:** Add WAV output through `synthesizeToFile`, `awaitSynthCompletion`, and synthesis callbacks for WinRT and SAPI.
+
 ## 4.2.5
 
 ### Fixes
