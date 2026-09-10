@@ -722,7 +722,8 @@ namespace {
 			if (text.empty() || fileName.empty() || text.find('\0') != std::string::npos ||
 				fileName.find('\0') != std::string::npos) { result->Success(0); return; }
 			try {
-				auto path = std::filesystem::u8path(fileName);
+				// 将 Dart 的 UTF-8 路径转为 Windows 原生 UTF-16，避免依赖系统代码页。
+				auto path = std::filesystem::path(winrt::to_hstring(fileName).c_str());
 				const bool fullPath = fullIt != map->end() && std::get<bool>(fullIt->second);
 				if (fullPath != path.is_absolute() || !path.has_filename()) {
 					result->Success(0); return;
