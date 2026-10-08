@@ -83,10 +83,15 @@ namespace {
 		FlutterTtsPlugin();
 		virtual ~FlutterTtsPlugin();
 	private:
+		friend class FlutterTtsPluginTest;
 		// Called when a method is called on this plugin's channel from Dart.
 		void HandleMethodCall(
 			const flutter::MethodCall<flutter::EncodableValue>& method_call,
 			std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+		void DispatchMethodCall(
+			const flutter::MethodCall<flutter::EncodableValue>& method_call,
+			FlutterResult& result);
+		void ensureSynthesizer();
 		void speak(const std::string, FlutterResult);
 		std::function<void()> synthesisWriter(const std::string&, const std::filesystem::path&);
 		bool awaitSynthCompletion = false;
@@ -105,11 +110,13 @@ namespace {
 		winrt::Windows::Foundation::IAsyncAction asyncSpeak(const std::string);
 		bool speaking();
 		bool paused();
-		SpeechSynthesizer synth;
-		winrt::Windows::Media::Playback::MediaPlayer mPlayer;
-		bool isPaused;
-		bool isSpeaking;
-		bool awaitSpeakCompletion;
+		// A default WinRT constructor activates the system component before the
+		// plugin constructor body runs. Registration must not require working TTS.
+		SpeechSynthesizer synth{ nullptr };
+		winrt::Windows::Media::Playback::MediaPlayer mPlayer{ nullptr };
+		bool isPaused = false;
+		bool isSpeaking = false;
+		bool awaitSpeakCompletion = false;
 		FlutterResult speakResult;
 	};
 
@@ -128,10 +135,14 @@ namespace {
 		registrar->AddPlugin(std::move(plugin));
 	}
 
+	void FlutterTtsPlugin::ensureSynthesizer() {
+		if (!synth) synth = SpeechSynthesizer();
+	}
+
 	void FlutterTtsPlugin::addMplayer() {
-		mPlayer = winrt::Windows::Media::Playback::MediaPlayer::MediaPlayer();
+		auto player = winrt::Windows::Media::Playback::MediaPlayer();
 		auto mEndedToken =
-			mPlayer.MediaEnded([=](Windows::Media::Playback::MediaPlayer const& sender,
+			player.MediaEnded([=](Windows::Media::Playback::MediaPlayer const& sender,
 				Windows::Foundation::IInspectable const& args)
 				{
 				    methodChannel->InvokeMethod("speak.onComplete", NULL);
@@ -140,6 +151,7 @@ namespace {
                     }
 					isSpeaking = false;
 				});
+		mPlayer = std::move(player);
 	}
 
 	bool FlutterTtsPlugin::speaking() {
@@ -209,6 +221,7 @@ namespace {
 	}
 
 	void FlutterTtsPlugin::pause() {
+		if (!mPlayer) return;
 		mPlayer.Pause();
 		isPaused = true;
 		methodChannel->InvokeMethod("speak.onPause", NULL);
@@ -222,12 +235,15 @@ namespace {
 
 	void FlutterTtsPlugin::stop() {
 	    methodChannel->InvokeMethod("speak.onCancel", NULL);
-        if (awaitSpeakCompletion) {
+		if (awaitSpeakCompletion && speakResult) {
             speakResult->Success(1);
+			speakResult.reset();
         }
 
-		mPlayer.Close();
-		addMplayer();
+		if (mPlayer) {
+			mPlayer.Pause();
+			mPlayer.Source(nullptr);
+		}
 		isSpeaking = false;
 		isPaused = false;
 	}
@@ -308,20 +324,20 @@ namespace {
 	}
 
 
-	FlutterTtsPlugin::FlutterTtsPlugin() {
-		synth = SpeechSynthesizer();
-		addMplayer();
-		isPaused = false;
-		isSpeaking = false;
-		awaitSpeakCompletion = false;
-		speakResult = FlutterResult();
+	FlutterTtsPlugin::FlutterTtsPlugin() = default;
+
+	FlutterTtsPlugin::~FlutterTtsPlugin() {
+		synthesisState->alive = false;
+		// Cleanup must also be safe after an activation or playback failure.
+		if (mPlayer) {
+			try { mPlayer.Close(); }
+			catch (...) { OutputDebugStringA("flutter_tts: MediaPlayer cleanup failed\n"); }
+		}
 	}
 
-	FlutterTtsPlugin::~FlutterTtsPlugin() { synthesisState->alive = false; mPlayer.Close(); }
-
-	void FlutterTtsPlugin::HandleMethodCall(
+	void FlutterTtsPlugin::DispatchMethodCall(
 		const flutter::MethodCall<flutter::EncodableValue>& method_call,
-		FlutterResult result) {
+		FlutterResult& result) {
 		if (method_call.method_name().compare("getPlatformVersion") == 0) {
 			std::ostringstream version_stream;
 			version_stream << "Windows UWP";
@@ -348,6 +364,9 @@ namespace {
 		void HandleMethodCall(
 			const flutter::MethodCall<flutter::EncodableValue>& method_call,
 			std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+		void DispatchMethodCall(
+			const flutter::MethodCall<flutter::EncodableValue>& method_call,
+			FlutterResult& result);
 
 		void speak(const std::string, FlutterResult);
 		std::function<void()> synthesisWriter(const std::string&, const std::filesystem::path&);
@@ -677,9 +696,9 @@ namespace {
 	}
 
 
-	void FlutterTtsPlugin::HandleMethodCall(
+	void FlutterTtsPlugin::DispatchMethodCall(
 		const flutter::MethodCall<flutter::EncodableValue>& method_call,
-		FlutterResult result) {
+		FlutterResult& result) {
 
 		if (method_call.method_name().compare("getPlatformVersion") == 0) {
 			std::ostringstream version_stream;
@@ -840,6 +859,62 @@ namespace {
 		}
 		else {
 			result->NotImplemented();
+		}
+	}
+
+	void FlutterTtsPlugin::HandleMethodCall(
+		const flutter::MethodCall<flutter::EncodableValue>& method_call,
+		FlutterResult result) {
+		const auto& method = method_call.method_name();
+		const char* stage = "method";
+		const auto reportError = [&](const std::string& message,
+			const flutter::EncodableMap& details) {
+			const std::string diagnostic = "flutter_tts: " + method + " (" + stage + "): " + message + "\n";
+			OutputDebugStringA(diagnostic.c_str());
+			if (result) result->Error(std::string(stage) == "method" ? "tts_error" : "tts_init_failed",
+				message, flutter::EncodableValue(details));
+		};
+		try {
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_DESKTOP_APP)
+			if (method == "speak" || method == "synthesizeToFile" ||
+				method == "getVoices" || method == "getLanguages" ||
+				method == "setVoice" || method == "setLanguage" ||
+				method == "setVolume" || method == "setPitch" || method == "setSpeechRate") {
+				stage = "speech_synthesizer";
+				ensureSynthesizer();
+			}
+			// File synthesis and voice/settings queries do not need a MediaPlayer.
+			if (method == "speak" && !mPlayer) {
+				stage = "media_player";
+				addMplayer();
+			}
+#endif
+			stage = "method";
+			DispatchMethodCall(method_call, result);
+		}
+		catch (const winrt::hresult_error& e) {
+			std::ostringstream code;
+			code << "0x" << std::hex << std::uppercase << static_cast<uint32_t>(e.code());
+			auto message = winrt::to_string(e.message());
+			if (message.empty()) message = "Windows text-to-speech failed";
+			message += " (HRESULT " + code.str() + ")";
+			reportError(message, {
+				{flutter::EncodableValue("method"), flutter::EncodableValue(method)},
+				{flutter::EncodableValue("stage"), flutter::EncodableValue(stage)},
+				{flutter::EncodableValue("hresult"), flutter::EncodableValue(code.str())},
+			});
+		}
+		catch (const std::exception& e) {
+			reportError(e.what(), {
+				{flutter::EncodableValue("method"), flutter::EncodableValue(method)},
+				{flutter::EncodableValue("stage"), flutter::EncodableValue(stage)},
+			});
+		}
+		catch (...) {
+			reportError("Unknown Windows text-to-speech error", {
+				{flutter::EncodableValue("method"), flutter::EncodableValue(method)},
+				{flutter::EncodableValue("stage"), flutter::EncodableValue(stage)},
+			});
 		}
 	}
 }
